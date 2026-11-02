@@ -13,9 +13,9 @@ on:
 env:
   MY_NAME: vps-b
   PEER_NAME: vps-a
-  PEER_REPO: galaljiu86-sudo/Repo-A # تم التعديل إلى مستودعك
+  PEER_REPO: galaljiu86-sudo/Repo-A
   PEER_BRANCH: main
-  START_CMD: "python bot.py" # أمر تشغيل السكريبت بتاعك
+  START_CMD: "sleep infinity"
   HANDOFF_MIN: "300"
   DEADLINE_MIN: "345"
   STOP_OLD_AFTER_READY: "false"
