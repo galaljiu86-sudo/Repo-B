@@ -1,0 +1,132 @@
+name: vps-relay
+
+on:
+  workflow_dispatch:
+    inputs:
+      receive:
+        description: "استقبل الملفات من الجهاز التاني"
+        required: false
+        default: "false"
+  schedule:
+    - cron: '7-59/15 * * * *'
+
+env:
+  MY_NAME: vps-b
+  PEER_NAME: vps-a
+  PEER_REPO: galaljiu86-sudo/Repo-A # تم التعديل إلى مستودعك
+  PEER_BRANCH: main
+  START_CMD: "python bot.py" # أمر تشغيل السكريبت بتاعك
+  HANDOFF_MIN: "300"
+  DEADLINE_MIN: "345"
+  STOP_OLD_AFTER_READY: "false"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: حارس يمنع تكرار التشغيل
+        id: guard
+        if: github.event_name == 'schedule'
+        env:
+          PAT: ${{ secrets.PAT }}
+          GHT: ${{ github.token }}
+        run: |
+          count() {
+            n=$(curl -s -H "Authorization: Bearer $1" \
+              "https://api.github.com/repos/$2/actions/runs?status=$3" | jq '.total_count // 0' 2>/dev/null)
+            echo "${n:-0}"
+          }
+          me=$(( $(count "$GHT" "${{ github.repository }}" in_progress) + $(count "$GHT" "${{ github.repository }}" queued) ))
+          peer=$(( $(count "$PAT" "$PEER_REPO" in_progress) + $(count "$PAT" "$PEER_REPO" queued) ))
+          echo "me=$me peer=$peer"
+          if [ "$me" -gt 1 ] || [ "$peer" -gt 0 ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "فيه سلسلة شغالة، هخرج."
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.guard.outputs.skip != 'true'
+
+      - name: علّم وقت البداية
+        if: steps.guard.outputs.skip != 'true'
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: اتصل بشبكة Tailscale
+        if: steps.guard.outputs.skip != 'true'
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+          hostname: ${{ env.MY_NAME }}
+          args: --ssh
+
+      - name: استقبل الملفات من الجهاز القديم
+        if: steps.guard.outputs.skip != 'true' && github.event.inputs.receive == 'true'
+        run: |
+          sudo apt-get install -y -qq netcat-openbsd jq > /dev/null
+          mkdir -p data
+          echo "بستنى الملفات (لحد 15 دقيقة)..."
+          timeout 900 nc -l 9000 | tar xzf - || echo "مفيش ملفات اتبعتت"
+          ls -la data
+
+      - name: شغّل الخدمة وأعلن إنك جاهز
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          mkdir -p data
+          [ -f requirements.txt ] && pip install -r requirements.txt
+          setsid nohup $START_CMD > out.log 2>&1 &
+          sleep 10
+          tail -n 20 out.log || true
+          if pgrep -f "$START_CMD" > /dev/null; then
+            mkdir -p /tmp/ready && echo ok > /tmp/ready/ready
+            setsid nohup python3 -m http.server 9001 --directory /tmp/ready > /dev/null 2>&1 &
+            echo "الخدمة شغالة"
+          else
+            echo "الخدمة وقعت! راجع out.log"
+          fi
+
+      - name: سلّم للجهاز التاني
+        if: steps.guard.outputs.skip != 'true'
+        env:
+          PAT: ${{ secrets.PAT }}
+        run: |
+          sudo apt-get install -y -qq netcat-openbsd jq > /dev/null
+          elapsed() { echo $(( $(date +%s) - JOB_START )); }
+
+          wait=$(( HANDOFF_MIN*60 - $(elapsed) ))
+          [ "$wait" -gt 0 ] && sleep "$wait"
+
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer $PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$PEER_REPO/actions/workflows/run.yml/dispatches" \
+              -d "{\"ref\":\"$PEER_BRANCH\",\"inputs\":{\"receive\":\"true\"}}")
+            echo "dispatch -> $code"
+            [ "$code" = "204" ] && break
+            sleep 20
+          done
+
+          discover() {
+            sudo tailscale status --json | jq -r --arg n "$PEER_NAME" \
+              '[.Peer[]? | select(.Online==true) | select(.HostName|test("^"+$n+"(-[0-9]+)?$"))] | sort_by(.Created) | last | .TailscaleIPs[0] // empty'
+          }
+          IP=""; SENT=0; READY=0
+          while [ "$(elapsed)" -lt $(( DEADLINE_MIN*60 )) ]; do
+            [ -z "$IP" ] && IP=$(discover)
+            if [ -n "$IP" ] && [ "$SENT" = 0 ]; then
+              if tar czf - data | nc -N -w 30 "$IP" 9000; then SENT=1; echo "الملفات اتبعتت"; fi
+            fi
+            if [ -n "$IP" ] && curl -sf --max-time 5 "http://$IP:9001/ready" > /dev/null; then
+              READY=1; break
+            fi
+            sleep 10
+          done
+
+          if [ "$READY" = 1 ]; then
+            echo "الجهاز التاني جاهز"
+            [ "$STOP_OLD_AFTER_READY" = "true" ] && pkill -f "$START_CMD" || true
+            sleep 120
+          else
+            echo "تحذير: التاني ما جهزش قبل الديدلاين، الحارس هيرجّع السلسلة."
+          fi
